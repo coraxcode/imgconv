@@ -1,0 +1,1398 @@
+/*=========================================================================
+ * IMGCONV v5.0 - Duke Nukem 3D / Build Engine Image Converter
+ * Converts PNG/JPEG -> PCX/BMP/GIF using PALETTE.DAT
+ *
+ * Usage: imgconv <input.png|jpg> <output.pcx|bmp|gif> [/d] [/t]
+ *   /d = Floyd-Steinberg dithering
+ *   /t = transparent sprite mode (allows palette index 255)
+ *
+ * Without /t, index 255 is PROTECTED (never used in output),
+ * ensuring opaque tiles have no invisible holes in Build Engine.
+ *
+ * PCX: standard 8-bit palette (0-255), HDPI/VDPI = image dimensions
+ * BMP: standard 8-bit palette (0-255), resolution = image dimensions
+ * GIF: standard 8-bit palette (0-255)
+ *
+ * Accepts any image size. No hard limits.
+ *
+ * Build (any platform):
+ *   gcc -O2 -o imgconv imgconv.c -lm
+ *
+ * PALETTE.DAT must be in the current directory.
+ * (C) 2025 - Public Domain - For Duke Nukem 3D modding
+ *=========================================================================*/
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <math.h>
+#include <ctype.h>
+
+/*=========================================================================
+ * Portable types (C89)
+ *=========================================================================*/
+typedef unsigned char  U8;
+typedef unsigned short U16;
+typedef unsigned long  U32;
+typedef signed short   S16;
+
+/*=========================================================================
+ * Image structure
+ *=========================================================================*/
+typedef struct {
+    int w, h;
+    U8 *rgb;      /* w*h*3, R G B interleaved */
+    U8 *indexed;  /* w*h, palette indices */
+} Image;
+
+#define BUILD_TRANSPARENT 255
+
+/*=========================================================================
+ * Duke3D palette: 8-bit RGB values (0-255), expanded from PALETTE.DAT
+ *=========================================================================*/
+static U8 pal[256][3];
+
+/*=========================================================================
+ * Utility functions
+ *=========================================================================*/
+static int clamp_i(int v, int lo, int hi) {
+    if (v < lo) return lo;
+    if (v > hi) return hi;
+    return v;
+}
+
+static int str_icmp(const char *a, const char *b) {
+    while (*a && *b) {
+        int ca = tolower((unsigned char)*a);
+        int cb = tolower((unsigned char)*b);
+        if (ca != cb) return ca - cb;
+        a++; b++;
+    }
+    return (unsigned char)*a - (unsigned char)*b;
+}
+
+static int is_pow2(int n) {
+    return n > 0 && (n & (n - 1)) == 0;
+}
+
+static void put16(FILE *f, U16 v) {
+    fputc((int)(v & 0xFF), f);
+    fputc((int)((v >> 8) & 0xFF), f);
+}
+
+static void put32(FILE *f, U32 v) {
+    fputc((int)(v & 0xFF), f);
+    fputc((int)((v >> 8) & 0xFF), f);
+    fputc((int)((v >> 16) & 0xFF), f);
+    fputc((int)((v >> 24) & 0xFF), f);
+}
+
+/*=========================================================================
+ * Palette loading
+ * PALETTE.DAT = 768 bytes of 6-bit VGA DAC values (0-63).
+ * We expand to standard 8-bit (0-255) for all use: quantization,
+ * PCX palette, BMP palette, GIF palette.
+ *=========================================================================*/
+static int load_palette(const char *path) {
+    FILE *f;
+    U8 raw[768];
+    int i;
+    f = fopen(path, "rb");
+    if (!f) return 0;
+    if (fread(raw, 1, 768, f) != 768) { fclose(f); return 0; }
+    fclose(f);
+    /* Convert 6-bit VGA (0-63) -> 8-bit (0-255) */
+    for (i = 0; i < 256; i++) {
+        pal[i][0] = (U8)((raw[i*3+0] << 2) | (raw[i*3+0] >> 4));
+        pal[i][1] = (U8)((raw[i*3+1] << 2) | (raw[i*3+1] >> 4));
+        pal[i][2] = (U8)((raw[i*3+2] << 2) | (raw[i*3+2] >> 4));
+    }
+    return 1;
+}
+
+static int find_palette(void) {
+    const char *paths[] = {
+        "PALETTE.DAT", "palette.dat", "Palette.dat",
+        "PALETTE.dat", "palette.DAT", NULL
+    };
+    int i;
+    for (i = 0; paths[i]; i++) {
+        if (load_palette(paths[i])) {
+            printf("Palette loaded: %s\n", paths[i]);
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/*=========================================================================
+ * Nearest palette color (perceptual weighted distance)
+ * skip255: exclude index 255 (Build Engine transparent)
+ *=========================================================================*/
+static U8 nearest_color(int r, int g, int b, int skip255) {
+    U32 best = 0xFFFFFFFFUL;
+    int best_i = 0, i;
+    int limit = skip255 ? 255 : 256;
+    for (i = 0; i < limit; i++) {
+        int dr = r - (int)pal[i][0];
+        int dg = g - (int)pal[i][1];
+        int db = b - (int)pal[i][2];
+        U32 d = (U32)(2*dr*dr + 4*dg*dg + 3*db*db);
+        if (d < best) {
+            best = d;
+            best_i = i;
+            if (d == 0) break;
+        }
+    }
+    return (U8)best_i;
+}
+
+/*=========================================================================
+ * Quantize RGB to palette (with optional Floyd-Steinberg dithering)
+ *=========================================================================*/
+static void quantize(Image *img, int dither, int skip255) {
+    int x, y, w = img->w, h = img->h;
+    img->indexed = (U8*)malloc((U32)w * (U32)h);
+    if (!img->indexed) return;
+
+    if (dither) {
+        int rb = (w + 2) * 3;
+        S16 *ec = (S16*)calloc((U32)rb, sizeof(S16));
+        S16 *en = (S16*)calloc((U32)rb, sizeof(S16));
+        S16 *tmp;
+        if (!ec || !en) {
+            free(ec); free(en); dither = 0;
+        } else {
+            for (y = 0; y < h; y++) {
+                memset(en, 0, (U32)rb * sizeof(S16));
+                for (x = 0; x < w; x++) {
+                    int idx = (y * w + x) * 3;
+                    int ex = (x + 1) * 3;
+                    int r, g, b, er, eg, eb;
+                    U8 ci;
+                    r = clamp_i((int)img->rgb[idx+0] + ec[ex+0], 0, 255);
+                    g = clamp_i((int)img->rgb[idx+1] + ec[ex+1], 0, 255);
+                    b = clamp_i((int)img->rgb[idx+2] + ec[ex+2], 0, 255);
+                    ci = nearest_color(r, g, b, skip255);
+                    img->indexed[y * w + x] = ci;
+                    er = r - (int)pal[ci][0];
+                    eg = g - (int)pal[ci][1];
+                    eb = b - (int)pal[ci][2];
+                    ec[ex+3] += (S16)(er * 7 / 16);
+                    ec[ex+4] += (S16)(eg * 7 / 16);
+                    ec[ex+5] += (S16)(eb * 7 / 16);
+                    en[ex-3] += (S16)(er * 3 / 16);
+                    en[ex-2] += (S16)(eg * 3 / 16);
+                    en[ex-1] += (S16)(eb * 3 / 16);
+                    en[ex+0] += (S16)(er * 5 / 16);
+                    en[ex+1] += (S16)(eg * 5 / 16);
+                    en[ex+2] += (S16)(eb * 5 / 16);
+                    en[ex+3] += (S16)(er * 1 / 16);
+                    en[ex+4] += (S16)(eg * 1 / 16);
+                    en[ex+5] += (S16)(eb * 1 / 16);
+                }
+                tmp = ec; ec = en; en = tmp;
+            }
+            free(ec); free(en);
+            return;
+        }
+    }
+    /* No dithering */
+    for (y = 0; y < h; y++) {
+        for (x = 0; x < w; x++) {
+            int idx = (y * w + x) * 3;
+            img->indexed[y * w + x] = nearest_color(
+                img->rgb[idx], img->rgb[idx+1], img->rgb[idx+2], skip255);
+        }
+    }
+}
+
+/*=========================================================================
+ * INFLATE (RFC 1951 deflate decompressor)
+ *=========================================================================*/
+typedef struct {
+    const U8 *data;
+    U32 len, pos;
+    U32 bitbuf;
+    int bits;
+} BitReader;
+
+static void br_init(BitReader *br, const U8 *d, U32 l) {
+    br->data = d; br->len = l; br->pos = 0;
+    br->bitbuf = 0; br->bits = 0;
+}
+
+static U32 br_read(BitReader *br, int n) {
+    U32 val;
+    if (n == 0) return 0;
+    while (br->bits < n) {
+        U8 byte = (br->pos < br->len) ? br->data[br->pos++] : 0;
+        br->bitbuf |= (U32)byte << br->bits;
+        br->bits += 8;
+    }
+    val = br->bitbuf & ((1UL << n) - 1);
+    br->bitbuf >>= n;
+    br->bits -= n;
+    return val;
+}
+
+#define HT_MAXBITS 15
+#define HT_MAXSYM  320
+
+typedef struct {
+    U16 counts[HT_MAXBITS + 1];
+    U16 symbols[HT_MAXSYM];
+} HTree;
+
+static void ht_build(HTree *ht, const U8 *lens, int nsym) {
+    int i, avail = 0;
+    U16 off[HT_MAXBITS + 1];
+    memset(ht->counts, 0, sizeof(ht->counts));
+    for (i = 0; i < nsym; i++)
+        if (lens[i] > 0 && lens[i] <= HT_MAXBITS)
+            ht->counts[lens[i]]++;
+    for (i = 1; i <= HT_MAXBITS; i++) {
+        off[i] = (U16)avail;
+        avail += ht->counts[i];
+    }
+    memset(ht->symbols, 0, sizeof(ht->symbols));
+    for (i = 0; i < nsym; i++)
+        if (lens[i] > 0 && lens[i] <= HT_MAXBITS)
+            ht->symbols[off[lens[i]]++] = (U16)i;
+}
+
+static int ht_decode(HTree *ht, BitReader *br) {
+    int code = 0, first = 0, idx = 0, i, cnt;
+    for (i = 1; i <= HT_MAXBITS; i++) {
+        code |= (int)br_read(br, 1);
+        cnt = ht->counts[i];
+        if (code - first < cnt)
+            return ht->symbols[idx + (code - first)];
+        idx += cnt;
+        first = (first + cnt) << 1;
+        code <<= 1;
+    }
+    return -1;
+}
+
+static HTree fixed_lit, fixed_dist;
+static int fixed_built = 0;
+
+static void build_fixed(void) {
+    U8 l[320];
+    int i;
+    if (fixed_built) return;
+    for (i =   0; i <= 143; i++) l[i] = 8;
+    for (i = 144; i <= 255; i++) l[i] = 9;
+    for (i = 256; i <= 279; i++) l[i] = 7;
+    for (i = 280; i <= 287; i++) l[i] = 8;
+    ht_build(&fixed_lit, l, 288);
+    for (i = 0; i < 32; i++) l[i] = 5;
+    ht_build(&fixed_dist, l, 32);
+    fixed_built = 1;
+}
+
+static const U16 len_base[] = {
+    3,4,5,6,7,8,9,10,11,13,15,17,19,23,27,31,
+    35,43,51,59,67,83,99,115,131,163,195,227,258
+};
+static const U8 len_extra[] = {
+    0,0,0,0,0,0,0,0,1,1,1,1,2,2,2,2,
+    3,3,3,3,4,4,4,4,5,5,5,5,0
+};
+static const U16 dist_base[] = {
+    1,2,3,4,5,7,9,13,17,25,33,49,65,97,129,193,
+    257,385,513,769,1025,1537,2049,3073,4097,6145,
+    8193,12289,16385,24577
+};
+static const U8 dist_extra[] = {
+    0,0,0,0,1,1,2,2,3,3,4,4,5,5,6,6,
+    7,7,8,8,9,9,10,10,11,11,12,12,13,13
+};
+static const int cl_order[] = {
+    16,17,18,0,8,7,9,6,10,5,11,4,12,3,13,2,14,1,15
+};
+
+typedef struct { U8 *data; U32 size, cap; } OutBuf;
+
+static void ob_init(OutBuf *o) {
+    o->data = NULL; o->size = 0; o->cap = 0;
+}
+
+static int ob_push(OutBuf *o, U8 b) {
+    if (o->size >= o->cap) {
+        U32 nc = o->cap ? o->cap * 2 : 8192;
+        U8 *nd = (U8*)realloc(o->data, nc);
+        if (!nd) return 0;
+        o->data = nd; o->cap = nc;
+    }
+    o->data[o->size++] = b;
+    return 1;
+}
+
+static U8 *inflate_data(const U8 *src, U32 srclen, U32 *outlen) {
+    BitReader br;
+    OutBuf ob;
+    int bfinal;
+
+    br_init(&br, src, srclen);
+    ob_init(&ob);
+    build_fixed();
+
+    do {
+        int btype;
+        HTree dyn_lit, dyn_dist;
+        HTree *plt, *pdt;
+
+        bfinal = (int)br_read(&br, 1);
+        btype  = (int)br_read(&br, 2);
+
+        if (btype == 0) {
+            U16 slen;
+            U32 k;
+            br.bitbuf = 0; br.bits = 0;
+            if (br.pos + 4 > br.len) goto fail;
+            slen = (U16)(br.data[br.pos] | ((U16)br.data[br.pos+1] << 8));
+            br.pos += 4;
+            if (br.pos + slen > br.len) goto fail;
+            for (k = 0; k < slen; k++)
+                if (!ob_push(&ob, br.data[br.pos++])) goto fail;
+            continue;
+        }
+
+        if (btype == 1) {
+            plt = &fixed_lit;
+            pdt = &fixed_dist;
+        } else if (btype == 2) {
+            int hlit  = (int)br_read(&br, 5) + 257;
+            int hdist = (int)br_read(&br, 5) + 1;
+            int hclen = (int)br_read(&br, 4) + 4;
+            U8 clens[320];
+            HTree cl_tree;
+            int ci, n;
+            memset(clens, 0, sizeof(clens));
+            for (ci = 0; ci < hclen; ci++)
+                clens[cl_order[ci]] = (U8)br_read(&br, 3);
+            ht_build(&cl_tree, clens, 19);
+            memset(clens, 0, sizeof(clens));
+            n = hlit + hdist;
+            ci = 0;
+            while (ci < n) {
+                int sym = ht_decode(&cl_tree, &br);
+                if (sym < 0) goto fail;
+                if (sym < 16) {
+                    clens[ci++] = (U8)sym;
+                } else if (sym == 16) {
+                    int rep = (int)br_read(&br, 2) + 3;
+                    U8 pv = ci > 0 ? clens[ci-1] : 0;
+                    while (rep-- > 0 && ci < n) clens[ci++] = pv;
+                } else if (sym == 17) {
+                    int rep = (int)br_read(&br, 3) + 3;
+                    while (rep-- > 0 && ci < n) clens[ci++] = 0;
+                } else {
+                    int rep = (int)br_read(&br, 7) + 11;
+                    while (rep-- > 0 && ci < n) clens[ci++] = 0;
+                }
+            }
+            ht_build(&dyn_lit, clens, hlit);
+            ht_build(&dyn_dist, clens + hlit, hdist);
+            plt = &dyn_lit;
+            pdt = &dyn_dist;
+        } else {
+            goto fail;
+        }
+
+        for (;;) {
+            int sym = ht_decode(plt, &br);
+            if (sym < 0) goto fail;
+            if (sym < 256) {
+                if (!ob_push(&ob, (U8)sym)) goto fail;
+            } else if (sym == 256) {
+                break;
+            } else {
+                int li = sym - 257;
+                U32 length, distance, k;
+                int di;
+                if (li < 0 || li > 28) goto fail;
+                length = (U32)len_base[li] + br_read(&br, (int)len_extra[li]);
+                di = ht_decode(pdt, &br);
+                if (di < 0 || di > 29) goto fail;
+                distance = (U32)dist_base[di] + br_read(&br, (int)dist_extra[di]);
+                if (distance == 0 || distance > ob.size) goto fail;
+                for (k = 0; k < length; k++)
+                    if (!ob_push(&ob, ob.data[ob.size - distance])) goto fail;
+            }
+        }
+    } while (!bfinal);
+
+    *outlen = ob.size;
+    return ob.data;
+fail:
+    free(ob.data);
+    *outlen = 0;
+    return NULL;
+}
+
+/*=========================================================================
+ * PNG DECODER
+ *=========================================================================*/
+static U32 png_u32(const U8 *p) {
+    return ((U32)p[0]<<24)|((U32)p[1]<<16)|((U32)p[2]<<8)|(U32)p[3];
+}
+
+static int paeth_pred(int a, int b, int c) {
+    int p = a + b - c;
+    int pa = abs(p - a), pb = abs(p - b), pc = abs(p - c);
+    if (pa <= pb && pa <= pc) return a;
+    return (pb <= pc) ? b : c;
+}
+
+static int decode_png(const char *path, Image *img) {
+    FILE *f;
+    U8 *fdata, *idat, *raw, *row, *prev;
+    U32 fsize, pos, isz, icap, rlen;
+    int w = 0, h = 0, depth = 0, ctype = 0;
+    int bpp, stride, x, y, channels;
+    U8 plte[256][3];
+    int plte_n = 0;
+    size_t rd;
+
+    f = fopen(path, "rb");
+    if (!f) { printf("Error: cannot open %s\n", path); return 0; }
+    fseek(f, 0, SEEK_END);
+    fsize = (U32)ftell(f);
+    fseek(f, 0, SEEK_SET);
+    fdata = (U8*)malloc(fsize);
+    if (!fdata) { fclose(f); return 0; }
+    rd = fread(fdata, 1, fsize, f);
+    fclose(f);
+    if ((U32)rd != fsize) { free(fdata); return 0; }
+
+    if (fsize < 8 || memcmp(fdata, "\x89PNG\r\n\x1a\n", 8) != 0) {
+        printf("Error: not a valid PNG file\n");
+        free(fdata);
+        return 0;
+    }
+
+    idat = NULL; isz = 0; icap = 0;
+    memset(plte, 0, sizeof(plte));
+    pos = 8;
+
+    while (pos + 12 <= fsize) {
+        U32 clen = png_u32(fdata + pos);
+        const U8 *tag = fdata + pos + 4;
+        const U8 *cd  = fdata + pos + 8;
+
+        if (memcmp(tag, "IHDR", 4) == 0 && clen >= 13) {
+            w = (int)png_u32(cd);
+            h = (int)png_u32(cd + 4);
+            depth = cd[8];
+            ctype = cd[9];
+            if (cd[10] || cd[11]) {
+                printf("Error: unsupported PNG compression/filter\n");
+                free(fdata); free(idat); return 0;
+            }
+            if (cd[12]) {
+                printf("Error: interlaced PNG not supported\n");
+                free(fdata); free(idat); return 0;
+            }
+        } else if (memcmp(tag, "PLTE", 4) == 0) {
+            int nc = (int)(clen / 3), ci;
+            if (nc > 256) nc = 256;
+            for (ci = 0; ci < nc; ci++) {
+                plte[ci][0] = cd[ci*3+0];
+                plte[ci][1] = cd[ci*3+1];
+                plte[ci][2] = cd[ci*3+2];
+            }
+            plte_n = nc;
+        } else if (memcmp(tag, "IDAT", 4) == 0) {
+            if (isz + clen > icap) {
+                U32 nc = (isz + clen) * 2;
+                U8 *nb = (U8*)realloc(idat, nc);
+                if (!nb) { free(fdata); free(idat); return 0; }
+                idat = nb; icap = nc;
+            }
+            memcpy(idat + isz, cd, clen);
+            isz += clen;
+        } else if (memcmp(tag, "IEND", 4) == 0) {
+            break;
+        }
+        pos += 12 + clen;
+    }
+    free(fdata);
+
+    if (w <= 0 || h <= 0 || !idat) {
+        printf("Error: invalid PNG\n");
+        free(idat); return 0;
+    }
+    if (depth != 8) {
+        printf("Error: only 8-bit PNG supported (got %d-bit)\n", depth);
+        free(idat); return 0;
+    }
+    if (ctype != 0 && ctype != 2 && ctype != 3 && ctype != 4 && ctype != 6) {
+        printf("Error: unsupported PNG color type %d\n", ctype);
+        free(idat); return 0;
+    }
+    if (ctype == 3 && plte_n == 0) {
+        printf("Error: palette PNG without PLTE chunk\n");
+        free(idat); return 0;
+    }
+
+    switch (ctype) {
+        case 0: channels = 1; break;
+        case 2: channels = 3; break;
+        case 3: channels = 1; break;
+        case 4: channels = 2; break;
+        case 6: channels = 4; break;
+        default: channels = 1; break;
+    }
+    bpp = channels;
+    stride = w * bpp;
+
+    /* Decompress (skip zlib header) */
+    if (isz < 6) { free(idat); return 0; }
+    {
+        U8 flg = idat[1];
+        U32 skip = 2;
+        if (flg & 0x20) skip += 4;
+        raw = inflate_data(idat + skip, isz - skip, &rlen);
+    }
+    free(idat);
+
+    if (!raw) { printf("Error: PNG decompression failed\n"); return 0; }
+    if (rlen < (U32)h * (1 + (U32)stride)) {
+        printf("Error: PNG data too short\n");
+        free(raw); return 0;
+    }
+
+    img->w = w; img->h = h;
+    img->rgb = (U8*)malloc((U32)w * (U32)h * 3);
+    img->indexed = NULL;
+    if (!img->rgb) { free(raw); return 0; }
+
+    prev = (U8*)calloc(1, (U32)stride);
+    row  = (U8*)malloc((U32)stride);
+    if (!prev || !row) {
+        free(raw); free(prev); free(row);
+        free(img->rgb); img->rgb = NULL;
+        return 0;
+    }
+
+    for (y = 0; y < h; y++) {
+        U8 *sr = raw + (U32)y * (1 + (U32)stride);
+        U8 filt = sr[0];
+        U8 *cur = sr + 1;
+
+        for (x = 0; x < stride; x++) {
+            U8 a  = (x >= bpp) ? row[x - bpp] : 0;
+            U8 b2 = prev[x];
+            U8 c2 = (x >= bpp) ? prev[x - bpp] : 0;
+            switch (filt) {
+                case 0: row[x] = cur[x]; break;
+                case 1: row[x] = (U8)(cur[x] + a); break;
+                case 2: row[x] = (U8)(cur[x] + b2); break;
+                case 3: row[x] = (U8)(cur[x] + ((a + b2) >> 1)); break;
+                case 4: row[x] = (U8)(cur[x] + paeth_pred(a, b2, c2)); break;
+                default: row[x] = cur[x]; break;
+            }
+        }
+
+        for (x = 0; x < w; x++) {
+            U8 *dst = img->rgb + ((U32)y * (U32)w + (U32)x) * 3;
+            switch (ctype) {
+                case 0:
+                    dst[0] = dst[1] = dst[2] = row[x];
+                    break;
+                case 2:
+                    dst[0] = row[x*3+0];
+                    dst[1] = row[x*3+1];
+                    dst[2] = row[x*3+2];
+                    break;
+                case 3: {
+                    U8 pi = row[x];
+                    if (pi < (U8)plte_n) {
+                        dst[0] = plte[pi][0];
+                        dst[1] = plte[pi][1];
+                        dst[2] = plte[pi][2];
+                    } else {
+                        dst[0] = dst[1] = dst[2] = 0;
+                    }
+                    break;
+                }
+                case 4:
+                    dst[0] = dst[1] = dst[2] = row[x*2];
+                    break;
+                case 6:
+                    dst[0] = row[x*4+0];
+                    dst[1] = row[x*4+1];
+                    dst[2] = row[x*4+2];
+                    break;
+            }
+        }
+        memcpy(prev, row, (U32)stride);
+    }
+
+    free(prev); free(row); free(raw);
+    printf("PNG loaded: %dx%d (type=%d)\n", w, h, ctype);
+    return 1;
+}
+
+/*=========================================================================
+ * JPEG DECODER - Baseline DCT (SOF0)
+ *=========================================================================*/
+static const U8 jzz[64] = {
+     0, 1, 8,16, 9, 2, 3,10, 17,24,32,25,18,11, 4, 5,
+    12,19,26,33,40,48,41,34, 27,20,13, 6, 7,14,21,28,
+    35,42,49,56,57,50,43,36, 29,22,15,23,30,37,44,51,
+    58,59,52,45,38,31,39,46, 53,60,61,54,47,55,62,63
+};
+
+typedef struct {
+    U8 bits[17]; U8 vals[256];
+    int maxcode[18], valptr[17], mincode[17];
+} JHuff;
+
+typedef struct {
+    int w, h, ncomp;
+    int qi[4], hdc[4], hac[4];
+    int hs[4], vs[4], mh, mv;
+    int qtab[4][64];
+    JHuff dch[4], ach[4];
+    int ri;
+    const U8 *scan;
+    U32 scan_len, scan_pos;
+    U32 bitbuf;
+    int bitcnt;
+    int dc_pred[4];
+    int hit_marker;
+} JCtx;
+
+static void jh_build(JHuff *ht) {
+    int i, code = 0, idx = 0;
+    for (i = 1; i <= 16; i++) {
+        ht->mincode[i] = code;
+        ht->valptr[i]  = idx;
+        ht->maxcode[i] = ht->bits[i] ? (code + ht->bits[i] - 1) : -1;
+        code += ht->bits[i];
+        idx  += ht->bits[i];
+        code <<= 1;
+    }
+}
+
+static int j_nextbyte(JCtx *j) {
+    U8 b, m;
+    if (j->hit_marker) return 0;
+    for (;;) {
+        if (j->scan_pos >= j->scan_len) { j->hit_marker = 1; return 0; }
+        b = j->scan[j->scan_pos++];
+        if (b != 0xFF) return (int)b;
+        if (j->scan_pos >= j->scan_len) { j->hit_marker = 1; return 0; }
+        m = j->scan[j->scan_pos];
+        if (m == 0x00) { j->scan_pos++; return 0xFF; }
+        if (m == 0xFF) continue;
+        j->scan_pos--;
+        j->hit_marker = 1;
+        return 0;
+    }
+}
+
+static int j_getbits(JCtx *j, int n) {
+    int val;
+    while (j->bitcnt < n) {
+        j->bitbuf = (j->bitbuf << 8) | (U32)j_nextbyte(j);
+        j->bitcnt += 8;
+    }
+    j->bitcnt -= n;
+    val = (int)((j->bitbuf >> j->bitcnt) & ((1U << n) - 1));
+    return val;
+}
+
+static int j_huffdec(JCtx *j, JHuff *ht) {
+    int code = 0, i;
+    for (i = 1; i <= 16; i++) {
+        code = (code << 1) | j_getbits(j, 1);
+        if (ht->maxcode[i] >= 0 && code <= ht->maxcode[i])
+            return ht->vals[ht->valptr[i] + code - ht->mincode[i]];
+    }
+    return 0;
+}
+
+static int j_extend(int v, int t) {
+    if (t == 0) return 0;
+    return (v < (1 << (t - 1))) ? v - (1 << t) + 1 : v;
+}
+
+static void j_skip_restart(JCtx *j) {
+    while (j->scan_pos + 1 < j->scan_len) {
+        if (j->scan[j->scan_pos] == 0xFF) {
+            U8 m = j->scan[j->scan_pos + 1];
+            if (m >= 0xD0 && m <= 0xD7) {
+                j->scan_pos += 2; j->hit_marker = 0; return;
+            }
+            if (m == 0xD9) { j->hit_marker = 0; return; }
+            if (m == 0x00) { j->scan_pos += 2; continue; }
+            if (m == 0xFF) { j->scan_pos++; continue; }
+        }
+        j->scan_pos++;
+    }
+    j->hit_marker = 0;
+}
+
+/* Integer IDCT (AAN/IJG): row>>11, col>>18 */
+#define FX0298 2446
+#define FX0390 3196
+#define FX0541 4433
+#define FX0765 6270
+#define FX0899 7373
+#define FX1175 9633
+#define FX1501 12299
+#define FX1847 15137
+#define FX1961 16069
+#define FX2053 16819
+#define FX2562 20995
+#define FX3072 25172
+
+static void j_idct(int *bl) {
+    int i, *bp;
+    for (i = 0, bp = bl; i < 8; i++, bp += 8) {
+        int t0,t1,t2,t3,t10,t11,t12,t13,z1,z2,z3,z4,z5;
+        if (!bp[1]&&!bp[2]&&!bp[3]&&!bp[4]&&!bp[5]&&!bp[6]&&!bp[7]) {
+            int dc = bp[0] << 2;
+            bp[0]=bp[1]=bp[2]=bp[3]=bp[4]=bp[5]=bp[6]=bp[7]=dc;
+            continue;
+        }
+        z2=bp[2]; z3=bp[6];
+        z1=(z2+z3)*FX0541; t2=z1-z3*FX1847; t3=z1+z2*FX0765;
+        t0=(bp[0]+bp[4])<<13; t1=(bp[0]-bp[4])<<13;
+        t10=t0+t3; t13=t0-t3; t11=t1+t2; t12=t1-t2;
+        t0=bp[7]; t1=bp[5]; t2=bp[3]; t3=bp[1];
+        z1=t0+t3; z2=t1+t2; z3=t0+t2; z4=t1+t3;
+        z5=(z3+z4)*FX1175;
+        t0*=FX0298; t1*=FX2053; t2*=FX3072; t3*=FX1501;
+        z1*=-FX0899; z2*=-FX2562;
+        z3=z3*(-FX1961)+z5; z4=z4*(-FX0390)+z5;
+        t0+=z1+z3; t1+=z2+z4; t2+=z2+z3; t3+=z1+z4;
+        bp[0]=(t10+t3)>>11; bp[7]=(t10-t3)>>11;
+        bp[1]=(t11+t2)>>11; bp[6]=(t11-t2)>>11;
+        bp[2]=(t12+t1)>>11; bp[5]=(t12-t1)>>11;
+        bp[3]=(t13+t0)>>11; bp[4]=(t13-t0)>>11;
+    }
+    for (i = 0, bp = bl; i < 8; i++, bp++) {
+        int t0,t1,t2,t3,t10,t11,t12,t13,z1,z2,z3,z4,z5;
+        z2=bp[16]; z3=bp[48];
+        z1=(z2+z3)*FX0541; t2=z1-z3*FX1847; t3=z1+z2*FX0765;
+        t0=(bp[0]+bp[32])<<13; t1=(bp[0]-bp[32])<<13;
+        t10=t0+t3; t13=t0-t3; t11=t1+t2; t12=t1-t2;
+        t0=bp[56]; t1=bp[40]; t2=bp[24]; t3=bp[8];
+        z1=t0+t3; z2=t1+t2; z3=t0+t2; z4=t1+t3;
+        z5=(z3+z4)*FX1175;
+        t0*=FX0298; t1*=FX2053; t2*=FX3072; t3*=FX1501;
+        z1*=-FX0899; z2*=-FX2562;
+        z3=z3*(-FX1961)+z5; z4=z4*(-FX0390)+z5;
+        t0+=z1+z3; t1+=z2+z4; t2+=z2+z3; t3+=z1+z4;
+        bp[0] =(t10+t3)>>18; bp[56]=(t10-t3)>>18;
+        bp[8] =(t11+t2)>>18; bp[48]=(t11-t2)>>18;
+        bp[16]=(t12+t1)>>18; bp[40]=(t12-t1)>>18;
+        bp[24]=(t13+t0)>>18; bp[32]=(t13-t0)>>18;
+    }
+}
+
+static void j_decode_block(JCtx *j, int *block, int comp) {
+    int s, rs, k, run, val;
+    JHuff *dc = &j->dch[j->hdc[comp]];
+    JHuff *ac = &j->ach[j->hac[comp]];
+    int *qt = j->qtab[j->qi[comp]];
+    memset(block, 0, 64 * sizeof(int));
+    s = j_huffdec(j, dc);
+    val = (s > 0) ? j_extend(j_getbits(j, s), s) : 0;
+    j->dc_pred[comp] += val;
+    block[0] = j->dc_pred[comp] * qt[0];
+    k = 1;
+    while (k < 64) {
+        rs = j_huffdec(j, ac);
+        s = rs & 0x0F;
+        run = (rs >> 4) & 0x0F;
+        if (s == 0) {
+            if (run == 0) break;
+            if (run == 0x0F) { k += 16; continue; }
+            break;
+        }
+        k += run;
+        if (k >= 64) break;
+        val = j_extend(j_getbits(j, s), s);
+        block[(int)jzz[k]] = val * qt[k];
+        k++;
+    }
+    j_idct(block);
+}
+
+static int decode_jpeg(const char *path, Image *img) {
+    FILE *f;
+    U8 *fdata;
+    U32 fsize, fpos;
+    JCtx j;
+    int mcuw, mcuh, nmcux, nmcuy, mx, my, bx, by;
+    const U8 *scan_start = NULL;
+    U32 scan_len = 0;
+    size_t rd;
+
+    memset(&j, 0, sizeof(j));
+    f = fopen(path, "rb");
+    if (!f) { printf("Error: cannot open %s\n", path); return 0; }
+    fseek(f, 0, SEEK_END);
+    fsize = (U32)ftell(f);
+    fseek(f, 0, SEEK_SET);
+    fdata = (U8*)malloc(fsize);
+    if (!fdata) { fclose(f); return 0; }
+    rd = fread(fdata, 1, fsize, f);
+    fclose(f);
+    if ((U32)rd != fsize) { free(fdata); return 0; }
+    if (fsize < 2 || fdata[0] != 0xFF || fdata[1] != 0xD8) {
+        printf("Error: not a JPEG\n"); free(fdata); return 0;
+    }
+
+    fpos = 2;
+    while (fpos + 1 < fsize) {
+        U8 marker;
+        U16 mlen;
+        if (fdata[fpos] != 0xFF) { fpos++; continue; }
+        marker = fdata[fpos + 1];
+        fpos += 2;
+        if (marker == 0xD9) break;
+        if (marker == 0x00 || marker == 0x01 ||
+            (marker >= 0xD0 && marker <= 0xD7) || marker == 0xFF)
+            continue;
+        if (fpos + 2 > fsize) break;
+        mlen = (U16)((fdata[fpos] << 8) | fdata[fpos + 1]);
+        if (mlen < 2 || fpos + mlen > fsize) break;
+
+        if (marker == 0xC0) {
+            int ci;
+            j.h = (fdata[fpos+3] << 8) | fdata[fpos+4];
+            j.w = (fdata[fpos+5] << 8) | fdata[fpos+6];
+            j.ncomp = fdata[fpos+7];
+            if (j.ncomp > 4) j.ncomp = 4;
+            j.mh = 1; j.mv = 1;
+            for (ci = 0; ci < j.ncomp; ci++) {
+                U8 sb = fdata[fpos + 8 + ci*3 + 1];
+                j.hs[ci] = (sb >> 4) & 0xF;
+                j.vs[ci] = sb & 0xF;
+                j.qi[ci] = fdata[fpos + 8 + ci*3 + 2];
+                if (j.hs[ci] > j.mh) j.mh = j.hs[ci];
+                if (j.vs[ci] > j.mv) j.mv = j.vs[ci];
+            }
+        } else if (marker == 0xC4) {
+            U32 off = fpos + 2;
+            while (off + 17 <= (U32)fpos + mlen) {
+                U8 tc_th = fdata[off++];
+                int tc = (tc_th >> 4) & 1, th = tc_th & 3;
+                JHuff *ht = tc ? &j.ach[th] : &j.dch[th];
+                int total = 0, hi;
+                for (hi = 1; hi <= 16; hi++) {
+                    ht->bits[hi] = fdata[off++];
+                    total += ht->bits[hi];
+                }
+                if (off + (U32)total > (U32)fpos + mlen) break;
+                memcpy(ht->vals, fdata + off, (U32)total);
+                off += (U32)total;
+                jh_build(ht);
+            }
+        } else if (marker == 0xDB) {
+            U32 off = fpos + 2;
+            while (off < (U32)fpos + mlen) {
+                U8 pq = fdata[off++];
+                int tq = pq & 3, prec = (pq >> 4) & 0xF, qi;
+                for (qi = 0; qi < 64; qi++) {
+                    if (prec) {
+                        j.qtab[tq][qi] = (fdata[off] << 8) | fdata[off+1];
+                        off += 2;
+                    } else {
+                        j.qtab[tq][qi] = fdata[off++];
+                    }
+                }
+            }
+        } else if (marker == 0xDD) {
+            j.ri = (fdata[fpos+2] << 8) | fdata[fpos+3];
+        } else if (marker == 0xDA) {
+            int ns = fdata[fpos+2], si;
+            for (si = 0; si < ns && si < 4; si++) {
+                U8 ta = fdata[fpos + 4 + si*2];
+                j.hdc[si] = (ta >> 4) & 3;
+                j.hac[si] = ta & 3;
+            }
+            scan_start = fdata + fpos + mlen;
+            scan_len = fsize - (fpos + mlen);
+            goto start_decode;
+        }
+        fpos += mlen;
+    }
+    printf("Error: no SOS marker in JPEG\n");
+    free(fdata);
+    return 0;
+
+start_decode:
+    if (j.w <= 0 || j.h <= 0) { free(fdata); return 0; }
+    j.scan = scan_start;
+    j.scan_len = scan_len;
+    j.scan_pos = 0;
+    j.bitbuf = 0;
+    j.bitcnt = 0;
+    j.hit_marker = 0;
+    memset(j.dc_pred, 0, sizeof(j.dc_pred));
+
+    img->w = j.w; img->h = j.h;
+    img->rgb = (U8*)calloc((U32)j.w * (U32)j.h, 3);
+    img->indexed = NULL;
+    if (!img->rgb) { free(fdata); return 0; }
+
+    mcuw = j.mh * 8;
+    mcuh = j.mv * 8;
+    nmcux = (j.w + mcuw - 1) / mcuw;
+    nmcuy = (j.h + mcuh - 1) / mcuh;
+
+    {
+        int mcu_count = 0;
+        for (my = 0; my < nmcuy; my++) {
+            for (mx = 0; mx < nmcux; mx++) {
+                int blocks[4][4][64];
+                int comp, bi;
+
+                for (comp = 0; comp < j.ncomp; comp++) {
+                    int nb = j.hs[comp] * j.vs[comp];
+                    for (bi = 0; bi < nb; bi++)
+                        j_decode_block(&j, blocks[comp][bi], comp);
+                }
+
+                for (by = 0; by < mcuh; by++) {
+                    for (bx = 0; bx < mcuw; bx++) {
+                        int px = mx * mcuw + bx;
+                        int py = my * mcuh + by;
+                        int yy, cb, cr, r2, g2, b2;
+                        int sx, sy, bidx, lx, ly, cx, cy;
+
+                        if (px >= j.w || py >= j.h) continue;
+
+                        sx = bx / (mcuw / j.hs[0]);
+                        sy = by / (mcuh / j.vs[0]);
+                        bidx = sy * j.hs[0] + sx;
+                        lx = bx - sx * (mcuw / j.hs[0]);
+                        ly = by - sy * (mcuh / j.vs[0]);
+                        yy = blocks[0][bidx][ly * 8 + lx] + 128;
+
+                        if (j.ncomp >= 3) {
+                            cx = bx * j.hs[1] / j.mh;
+                            cy = by * j.vs[1] / j.mv;
+                            cb = blocks[1][0][cy * 8 + cx];
+                            cx = bx * j.hs[2] / j.mh;
+                            cy = by * j.vs[2] / j.mv;
+                            cr = blocks[2][0][cy * 8 + cx];
+                            r2 = clamp_i(yy + ((cr * 91881) >> 16), 0, 255);
+                            g2 = clamp_i(yy - ((cb * 22554 + cr * 46802) >> 16), 0, 255);
+                            b2 = clamp_i(yy + ((cb * 116130) >> 16), 0, 255);
+                        } else {
+                            r2 = g2 = b2 = clamp_i(yy, 0, 255);
+                        }
+                        img->rgb[((U32)py * (U32)j.w + (U32)px) * 3 + 0] = (U8)r2;
+                        img->rgb[((U32)py * (U32)j.w + (U32)px) * 3 + 1] = (U8)g2;
+                        img->rgb[((U32)py * (U32)j.w + (U32)px) * 3 + 2] = (U8)b2;
+                    }
+                }
+
+                mcu_count++;
+                if (j.ri > 0 && (mcu_count % j.ri) == 0) {
+                    j.bitbuf = 0; j.bitcnt = 0; j.hit_marker = 0;
+                    j.dc_pred[0]=j.dc_pred[1]=j.dc_pred[2]=j.dc_pred[3]=0;
+                    j_skip_restart(&j);
+                }
+            }
+        }
+    }
+
+    free(fdata);
+    printf("JPEG loaded: %dx%d (%d comp)\n", j.w, j.h, j.ncomp);
+    return 1;
+}
+
+/*=========================================================================
+ * PCX ENCODER
+ * - Standard 8-bit palette (0-255) for CORRECT colors
+ * - HDPI/VDPI = image width x height (Build Engine convention)
+ * - Even bytes_per_line (PCX spec requirement)
+ *=========================================================================*/
+static int encode_pcx(const char *path, const Image *img) {
+    FILE *f;
+    int y, x;
+    U16 bpl = (U16)((img->w + 1) & ~1);
+
+    f = fopen(path, "wb");
+    if (!f) { printf("Error: cannot create %s\n", path); return 0; }
+
+    /* PCX Header (128 bytes) */
+    fputc(0x0A, f);                         /* manufacturer     */
+    fputc(5, f);                            /* version 5        */
+    fputc(1, f);                            /* RLE encoding     */
+    fputc(8, f);                            /* 8 bits/pixel     */
+    put16(f, 0);                            /* xmin             */
+    put16(f, 0);                            /* ymin             */
+    put16(f, (U16)(img->w - 1));            /* xmax             */
+    put16(f, (U16)(img->h - 1));            /* ymax             */
+    put16(f, (U16)img->w);                  /* HDPI = width     */
+    put16(f, (U16)img->h);                  /* VDPI = height    */
+    for (x = 0; x < 48; x++) fputc(0, f);  /* EGA palette      */
+    fputc(0, f);                            /* reserved         */
+    fputc(1, f);                            /* nplanes = 1      */
+    put16(f, bpl);                          /* bytes/line (even)*/
+    put16(f, 1);                            /* palette type     */
+    put16(f, (U16)img->w);                  /* screen width     */
+    put16(f, (U16)img->h);                  /* screen height    */
+    for (x = 0; x < 54; x++) fputc(0, f);  /* pad to 128       */
+
+    /* RLE-encoded pixel data */
+    for (y = 0; y < img->h; y++) {
+        const U8 *row = img->indexed + (U32)y * (U32)img->w;
+        x = 0;
+        while (x < (int)bpl) {
+            U8 val = (x < img->w) ? row[x] : 0;
+            int run = 1;
+            while (x + run < (int)bpl && run < 63) {
+                U8 nxt = (x + run < img->w) ? row[x + run] : 0;
+                if (nxt != val) break;
+                run++;
+            }
+            if (run > 1 || val >= 0xC0)
+                fputc(0xC0 | run, f);
+            fputc(val, f);
+            x += run;
+        }
+    }
+
+    /* 256-color palette: 0x0C + 768 bytes, 8-bit values (0-255) */
+    fputc(0x0C, f);
+    for (x = 0; x < 256; x++) {
+        fputc(pal[x][0], f);
+        fputc(pal[x][1], f);
+        fputc(pal[x][2], f);
+    }
+
+    fclose(f);
+    printf("PCX saved: %s (%dx%d, dpi=%dx%d)\n",
+           path, img->w, img->h, img->w, img->h);
+    return 1;
+}
+
+/*=========================================================================
+ * BMP ENCODER
+ * - Standard 8-bit palette (0-255) for CORRECT colors
+ * - biXPelsPerMeter = width, biYPelsPerMeter = height
+ * - Standard 4-byte row padding
+ *=========================================================================*/
+static int encode_bmp(const char *path, const Image *img) {
+    FILE *f;
+    int y, x;
+    int pad = (4 - (img->w % 4)) % 4;
+    U32 row_size = (U32)img->w + (U32)pad;
+    U32 img_size = row_size * (U32)img->h;
+    U32 file_size = 14 + 40 + 1024 + img_size;
+
+    f = fopen(path, "wb");
+    if (!f) { printf("Error: cannot create %s\n", path); return 0; }
+
+    /* BITMAPFILEHEADER (14 bytes) */
+    fputc('B', f); fputc('M', f);
+    put32(f, file_size);
+    put16(f, 0); put16(f, 0);
+    put32(f, 14 + 40 + 1024);        /* offset to pixel data */
+
+    /* BITMAPINFOHEADER (40 bytes) */
+    put32(f, 40);                     /* header size          */
+    put32(f, (U32)img->w);           /* width                */
+    put32(f, (U32)img->h);           /* height               */
+    put16(f, 1);                      /* planes               */
+    put16(f, 8);                      /* bits per pixel       */
+    put32(f, 0);                      /* compression = BI_RGB */
+    put32(f, img_size);               /* image data size      */
+    put32(f, (U32)img->w);           /* biXPelsPerMeter = W  */
+    put32(f, (U32)img->h);           /* biYPelsPerMeter = H  */
+    put32(f, 256);                    /* colors used          */
+    put32(f, 256);                    /* important colors     */
+
+    /* Color table: 256 entries, BGRA, 8-bit values (0-255) */
+    for (x = 0; x < 256; x++) {
+        fputc(pal[x][2], f);         /* Blue  */
+        fputc(pal[x][1], f);         /* Green */
+        fputc(pal[x][0], f);         /* Red   */
+        fputc(0, f);                  /* Reserved */
+    }
+
+    /* Pixel data: bottom-up, padded to 4-byte boundary */
+    for (y = img->h - 1; y >= 0; y--) {
+        fwrite(img->indexed + (U32)y * (U32)img->w, 1, (U32)img->w, f);
+        for (x = 0; x < pad; x++) fputc(0, f);
+    }
+
+    fclose(f);
+    printf("BMP saved: %s (%dx%d, res=%dx%d)\n",
+           path, img->w, img->h, img->w, img->h);
+    return 1;
+}
+
+/*=========================================================================
+ * GIF ENCODER (GIF89a, 256-color, LZW)
+ *=========================================================================*/
+#define GIF_MAX 4096
+
+typedef struct {
+    FILE *f;
+    int mcs, cs, cc, ec, nc;
+    U32 bb;
+    int nb;
+    U8 blk[256];
+    int bl;
+    U16 tp[GIF_MAX];
+    U8  ts[GIF_MAX];
+} GifEnc;
+
+static void gif_flush(GifEnc *g) {
+    if (g->bl > 0) {
+        fputc(g->bl, g->f);
+        fwrite(g->blk, 1, (U32)g->bl, g->f);
+        g->bl = 0;
+    }
+}
+
+static void gif_put(GifEnc *g, int code) {
+    g->bb |= (U32)code << g->nb;
+    g->nb += g->cs;
+    while (g->nb >= 8) {
+        g->blk[g->bl++] = (U8)(g->bb & 0xFF);
+        g->bb >>= 8;
+        g->nb -= 8;
+        if (g->bl >= 255) gif_flush(g);
+    }
+}
+
+static void gif_init(GifEnc *g) {
+    int i;
+    g->cs = g->mcs + 1;
+    g->cc = 1 << g->mcs;
+    g->ec = g->cc + 1;
+    g->nc = g->ec + 1;
+    for (i = 0; i < g->cc; i++) {
+        g->tp[i] = 0xFFFF;
+        g->ts[i] = (U8)i;
+    }
+}
+
+static int gif_find(GifEnc *g, int pfx, U8 sfx) {
+    int i;
+    for (i = g->ec + 1; i < g->nc; i++)
+        if (g->tp[i] == (U16)pfx && g->ts[i] == sfx)
+            return i;
+    return -1;
+}
+
+static int encode_gif(const char *path, const Image *img) {
+    FILE *f;
+    GifEnc g;
+    int i, cur;
+    U32 pi, total;
+
+    f = fopen(path, "wb");
+    if (!f) { printf("Error: cannot create %s\n", path); return 0; }
+
+    total = (U32)img->w * (U32)img->h;
+
+    /* Header */
+    fwrite("GIF89a", 1, 6, f);
+    put16(f, (U16)img->w);
+    put16(f, (U16)img->h);
+    fputc(0xF7, f);
+    fputc(0, f);
+    fputc(0, f);
+
+    /* Global color table: 8-bit values (0-255) */
+    for (i = 0; i < 256; i++) {
+        fputc(pal[i][0], f);
+        fputc(pal[i][1], f);
+        fputc(pal[i][2], f);
+    }
+
+    /* Image descriptor */
+    fputc(0x2C, f);
+    put16(f, 0); put16(f, 0);
+    put16(f, (U16)img->w);
+    put16(f, (U16)img->h);
+    fputc(0, f);
+
+    /* LZW data */
+    memset(&g, 0, sizeof(g));
+    g.f = f;
+    g.mcs = 8;
+    fputc(g.mcs, f);
+
+    gif_init(&g);
+    gif_put(&g, g.cc);
+
+    cur = img->indexed[0];
+    for (pi = 1; pi < total; pi++) {
+        U8 pix = img->indexed[pi];
+        int m = gif_find(&g, cur, pix);
+        if (m >= 0) {
+            cur = m;
+        } else {
+            gif_put(&g, cur);
+            if (g.nc < GIF_MAX) {
+                g.tp[g.nc] = (U16)cur;
+                g.ts[g.nc] = pix;
+                g.nc++;
+                if (g.nc > (1 << g.cs) && g.cs < 12)
+                    g.cs++;
+            } else {
+                gif_put(&g, g.cc);
+                gif_init(&g);
+            }
+            cur = pix;
+        }
+    }
+    gif_put(&g, cur);
+    gif_put(&g, g.ec);
+
+    if (g.nb > 0)
+        g.blk[g.bl++] = (U8)(g.bb & 0xFF);
+    gif_flush(&g);
+    fputc(0, f);
+    fputc(0x3B, f);
+
+    fclose(f);
+    printf("GIF saved: %s (%dx%d)\n", path, img->w, img->h);
+    return 1;
+}
+
+/*=========================================================================
+ * Format detection
+ *=========================================================================*/
+#define FMT_UNK 0
+#define FMT_PNG 1
+#define FMT_JPG 2
+#define FMT_BMP 10
+#define FMT_PCX 11
+#define FMT_GIF 12
+
+static int detect_fmt(const char *name) {
+    const char *ext = strrchr(name, '.');
+    if (!ext) return FMT_UNK;
+    ext++;
+    if (str_icmp(ext, "png")  == 0) return FMT_PNG;
+    if (str_icmp(ext, "jpg")  == 0) return FMT_JPG;
+    if (str_icmp(ext, "jpeg") == 0) return FMT_JPG;
+    if (str_icmp(ext, "bmp")  == 0) return FMT_BMP;
+    if (str_icmp(ext, "pcx")  == 0) return FMT_PCX;
+    if (str_icmp(ext, "gif")  == 0) return FMT_GIF;
+    return FMT_UNK;
+}
+
+/*=========================================================================
+ * MAIN
+ *=========================================================================*/
+int main(int argc, char *argv[]) {
+    Image img;
+    int infmt, outfmt, dither = 0, transparent = 0, skip255, ok, i;
+    int ic[256];
+
+    printf("=============================================\n");
+    printf(" IMGCONV v5.0 - Duke Nukem 3D Image Converter\n");
+    printf(" Build Engine Palette-Matched Conversion\n");
+    printf("=============================================\n\n");
+
+    if (argc < 3) {
+        printf("Usage: imgconv <input> <output> [/d] [/t]\n\n");
+        printf("  Input:  PNG, JPG, JPEG (any size)\n");
+        printf("  Output: PCX, BMP, GIF (256-color, DN3D palette)\n\n");
+        printf("  /d  Floyd-Steinberg dithering\n");
+        printf("  /t  Transparent sprite mode (allow index 255)\n\n");
+        printf("PALETTE.DAT must be in the current directory.\n\n");
+        printf("Build Engine notes:\n");
+        printf("  Index 255 = transparent (protected unless /t).\n");
+        printf("  PCX/BMP DPI/resolution = image dimensions.\n");
+        printf("  Tiles are usually power-of-2 (32,64,128,256).\n");
+        return 1;
+    }
+
+    for (i = 3; i < argc; i++) {
+        if (str_icmp(argv[i], "/d") == 0 || str_icmp(argv[i], "-d") == 0)
+            dither = 1;
+        if (str_icmp(argv[i], "/t") == 0 || str_icmp(argv[i], "-t") == 0)
+            transparent = 1;
+    }
+
+    if (!find_palette()) {
+        printf("Error: PALETTE.DAT not found!\n");
+        printf("Place Duke Nukem 3D's PALETTE.DAT in the current directory.\n");
+        return 1;
+    }
+
+    skip255 = !transparent;
+    if (skip255)
+        printf("Index 255 protected (opaque tile mode).\n");
+    else
+        printf("Transparent mode: index 255 allowed.\n");
+
+    infmt  = detect_fmt(argv[1]);
+    outfmt = detect_fmt(argv[2]);
+    if (infmt != FMT_PNG && infmt != FMT_JPG) {
+        printf("Error: input must be PNG or JPEG.\n");
+        return 1;
+    }
+    if (outfmt != FMT_BMP && outfmt != FMT_PCX && outfmt != FMT_GIF) {
+        printf("Error: output must be PCX, BMP, or GIF.\n");
+        return 1;
+    }
+
+    memset(&img, 0, sizeof(img));
+    printf("Loading %s...\n", argv[1]);
+    ok = (infmt == FMT_PNG) ? decode_png(argv[1], &img) : decode_jpeg(argv[1], &img);
+    if (!ok || !img.rgb) {
+        printf("Error: failed to decode input image.\n");
+        return 1;
+    }
+
+    if (!is_pow2(img.w) || !is_pow2(img.h))
+        printf("Note: %dx%d not power-of-2 (Build tiles use 16/32/64/128/256).\n",
+               img.w, img.h);
+
+    printf("Quantizing to Duke3D palette%s...\n",
+           dither ? " (dithered)" : "");
+    quantize(&img, dither, skip255);
+    if (!img.indexed) {
+        printf("Error: quantization failed.\n");
+        free(img.rgb);
+        return 1;
+    }
+
+    memset(ic, 0, sizeof(ic));
+    for (i = 0; i < img.w * img.h; i++)
+        ic[img.indexed[i]]++;
+    if (ic[BUILD_TRANSPARENT] > 0 && skip255)
+        printf("WARNING: index 255 present in output!\n");
+    {
+        int used = 0;
+        for (i = 0; i < 256; i++)
+            if (ic[i]) used++;
+        printf("Colors used: %d/256\n", used);
+    }
+
+    printf("Saving %s...\n", argv[2]);
+    switch (outfmt) {
+        case FMT_BMP: ok = encode_bmp(argv[2], &img); break;
+        case FMT_PCX: ok = encode_pcx(argv[2], &img); break;
+        case FMT_GIF: ok = encode_gif(argv[2], &img); break;
+        default: ok = 0; break;
+    }
+
+    free(img.rgb);
+    free(img.indexed);
+
+    if (ok) printf("\nDone! Conversion successful.\n");
+    else    printf("\nError: encoding failed.\n");
+    return ok ? 0 : 1;
+}
